@@ -1,0 +1,459 @@
+
+#include "esp_camera.h"
+#include "img_converters.h"
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESP32Servo.h>
+
+// ==================================================
+// WIFI
+// ==================================================
+const char* AP_SSID = "Robot-Car";
+const char* AP_PASS = "Robot123";
+
+// ==================================================
+// L298N MOTOR PINS
+// AI-Thinker-style ESP32-CAM assumed
+// ENA and ENB jumpers installed for fixed speed
+// ==================================================
+#define IN1 12
+#define IN2 13
+#define IN3 14
+#define IN4 15
+
+// ==================================================
+// SG90 SERVOS
+// ==================================================
+#define PAN_PIN  2
+#define TILT_PIN 4
+
+Servo panServo;
+Servo tiltServo;
+
+int panAngle = 90;
+int tiltAngle = 90;
+
+// ==================================================
+// WEB AND CAMERA SERVERS
+// ==================================================
+WebServer server(80);
+WiFiServer streamServer(81);
+
+WiFiClient streamClient;
+bool streamStarted = false;
+unsigned long lastFrameTime = 0;
+
+// ==================================================
+// AI-THINKER CAMERA PINOUT
+// ==================================================
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+// ==================================================
+// MOTOR CONTROL
+// Left motors: OUT1 and OUT2
+// Right motors: OUT3 and OUT4
+// ==================================================
+void stopCar() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+}
+
+void forwardCar() {
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+}
+
+void backwardCar() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+}
+
+void leftCar() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+}
+
+void rightCar() {
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+}
+
+// ==================================================
+// MOBILE CONTROL PAGE
+// ==================================================
+const char PAGE[] PROGMEM = R"HTML(
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport"
+ content="width=device-width,initial-scale=1">
+<title>Robot Car</title>
+<style>
+body {
+  font-family:Arial;
+  text-align:center;
+  background:#eeeeee;
+}
+button {
+  width:85px;
+  height:65px;
+  margin:5px;
+  font-size:23px;
+  border-radius:12px;
+}
+.stop {background:#ff7777;}
+img {width:100%;max-width:400px;}
+</style>
+</head>
+<body>
+<h2>ESP32-CAM Robot</h2>
+<p>Hold a direction button to drive.</p>
+
+<div>
+<button
+ onpointerdown="drive('forward')"
+ onpointerup="drive('stop')"
+ onpointerleave="drive('stop')"
+ oncontextmenu="return false">▲</button>
+</div>
+
+<div>
+<button
+ onpointerdown="drive('left')"
+ onpointerup="drive('stop')"
+ onpointerleave="drive('stop')">◀</button>
+
+<button class="stop"
+ onclick="drive('stop')">STOP</button>
+
+<button
+ onpointerdown="drive('right')"
+ onpointerup="drive('stop')"
+ onpointerleave="drive('stop')">▶</button>
+</div>
+
+<div>
+<button
+ onpointerdown="drive('backward')"
+ onpointerup="drive('stop')"
+ onpointerleave="drive('stop')">▼</button>
+</div>
+
+<h3>Camera Pan</h3>
+<button onclick="servo('pan',-10)">◀</button>
+<button onclick="servo('pan',10)">▶</button>
+
+<h3>Camera Tilt</h3>
+<button onclick="servo('tilt',-10)">▲</button>
+<button onclick="servo('tilt',10)">▼</button>
+
+<h3>Live Camera</h3>
+<img id="cam" alt="Camera stream unavailable">
+<p id="msg">Connecting to camera...</p>
+
+<script>
+function drive(direction) {
+  fetch('/move?d=' + direction).catch(()=>{});
+}
+
+function servo(axis, amount) {
+  fetch('/servo?a=' + axis + '&d=' + amount)
+    .catch(()=>{});
+}
+
+document.getElementById('cam').src =
+  'http://' + location.hostname + ':81/stream';
+
+document.getElementById('cam').onerror = function() {
+  document.getElementById('msg').textContent =
+    'Camera unavailable. Check Serial Monitor.';
+};
+</script>
+</body>
+</html>
+)HTML";
+
+// ==================================================
+// CAMERA STREAM CLIENT HANDLING
+// Converts RGB565 frames to JPEG in software
+// ==================================================
+void handleCameraStream() {
+  if (!streamClient || !streamClient.connected()) {
+    if (streamClient) {
+      streamClient.stop();
+    }
+    streamStarted = false;
+
+    WiFiClient incoming = streamServer.available();
+    if (incoming) {
+      streamClient = incoming;
+      streamStarted = false;
+    }
+  }
+
+  if (!streamClient || !streamClient.connected()) {
+    return;
+  }
+
+  if (!streamStarted) {
+    if (!streamClient.available()) {
+      return;
+    }
+
+    String requestLine = streamClient.readStringUntil('\n');
+    unsigned long start = millis();
+
+    while (streamClient.connected() &&
+           millis() - start < 300) {
+      if (!streamClient.available()) {
+        delay(1);
+        continue;
+      }
+
+      String line = streamClient.readStringUntil('\n');
+      if (line == "\r" || line.length() == 0) {
+        break;
+      }
+    }
+
+    if (requestLine.indexOf("GET /stream") < 0) {
+      streamClient.stop();
+      return;
+    }
+
+    streamClient.print(
+      "HTTP/1.1 200 OK\r\n"
+      "Content-Type: multipart/x-mixed-replace; "
+      "boundary=frame\r\n"
+      "Cache-Control: no-cache\r\n"
+      "Access-Control-Allow-Origin: *\r\n"
+      "Connection: close\r\n\r\n"
+    );
+
+    streamStarted = true;
+    lastFrameTime = 0;
+    return;
+  }
+
+  // Keep video rate low to reduce CPU and memory pressure.
+  if (millis() - lastFrameTime < 400) {
+    return;
+  }
+  lastFrameTime = millis();
+
+  camera_fb_t *fb = esp_camera_fb_get();
+
+  if (!fb) {
+    Serial.println("Camera frame capture failed");
+    return;
+  }
+
+  uint8_t *jpgBuffer = nullptr;
+  size_t jpgLength = 0;
+
+  bool converted = fmt2jpg(
+    fb->buf,
+    fb->len,
+    fb->width,
+    fb->height,
+    PIXFORMAT_RGB565,
+    60,
+    &jpgBuffer,
+    &jpgLength
+  );
+
+  esp_camera_fb_return(fb);
+
+  if (!converted || jpgBuffer == nullptr) {
+    Serial.println("RGB565 to JPEG conversion failed");
+    if (jpgBuffer) {
+      free(jpgBuffer);
+    }
+    return;
+  }
+
+  if (streamClient.connected()) {
+    streamClient.printf(
+      "--frame\r\n"
+      "Content-Type: image/jpeg\r\n"
+      "Content-Length: %u\r\n\r\n",
+      (unsigned int)jpgLength
+    );
+
+    size_t sent = streamClient.write(jpgBuffer, jpgLength);
+    streamClient.print("\r\n");
+
+    if (sent != jpgLength) {
+      streamClient.stop();
+      streamStarted = false;
+    }
+  }
+
+  free(jpgBuffer);
+}
+
+// ==================================================
+// SETUP
+// ==================================================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+
+  stopCar();
+
+  // Servo PWM initialization
+  panServo.setPeriodHertz(50);
+  tiltServo.setPeriodHertz(50);
+
+  panServo.attach(PAN_PIN, 500, 2400);
+  tiltServo.attach(TILT_PIN, 500, 2400);
+
+  panServo.write(panAngle);
+  tiltServo.write(tiltAngle);
+
+  // Camera configuration
+  camera_config_t config = {};
+
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+
+  // RHYX M21-45 camera fix:
+  // This sensor does not provide hardware JPEG output.
+  config.xclk_freq_hz = 10000000;
+  config.pixel_format = PIXFORMAT_RGB565;
+  config.frame_size = FRAMESIZE_QQVGA; // 160 x 120
+  config.fb_count = 1;
+  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+  config.fb_location = CAMERA_FB_IN_PSRAM;
+
+  esp_err_t cameraResult = esp_camera_init(&config);
+
+  if (cameraResult == ESP_OK) {
+    Serial.println("Camera initialized in RGB565 mode.");
+  } else {
+    Serial.printf(
+      "Camera init failed: 0x%x\n",
+      cameraResult
+    );
+    Serial.println(
+      "Wi-Fi and motor controls will still start."
+    );
+  }
+
+  // Start Wi-Fi access point
+  WiFi.mode(WIFI_AP);
+  WiFi.setSleep(false);
+  WiFi.softAP(AP_SSID, AP_PASS);
+
+  Serial.print("Robot Wi-Fi IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  // Main mobile webpage
+  server.on("/", HTTP_GET, []() {
+    server.send_P(200, "text/html", PAGE);
+  });
+
+  // Motor commands
+  server.on("/move", HTTP_GET, []() {
+    String direction = server.arg("d");
+
+    if (direction == "forward") {
+      forwardCar();
+    } else if (direction == "backward") {
+      backwardCar();
+    } else if (direction == "left") {
+      leftCar();
+    } else if (direction == "right") {
+      rightCar();
+    } else {
+      stopCar();
+    }
+
+    server.send(200, "text/plain", "OK");
+  });
+
+  // Pan and tilt commands
+  server.on("/servo", HTTP_GET, []() {
+    String axis = server.arg("a");
+    int delta = server.arg("d").toInt();
+
+    if (axis == "pan") {
+      panAngle = constrain(panAngle + delta, 0, 180);
+      panServo.write(panAngle);
+    } else if (axis == "tilt") {
+      tiltAngle = constrain(tiltAngle + delta, 30, 150);
+      tiltServo.write(tiltAngle);
+    }
+
+    server.send(200, "text/plain", "OK");
+  });
+
+  server.onNotFound([]() {
+    server.send(404, "text/plain", "Not found");
+  });
+
+  server.begin();
+  streamServer.begin();
+
+  Serial.println("Open http://192.168.4.1");
+}
+
+// ==================================================
+// MAIN LOOP
+// ==================================================
+void loop() {
+  server.handleClient();
+  handleCameraStream();
+  delay(1);
+}
